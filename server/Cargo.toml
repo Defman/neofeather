@@ -1,0 +1,20 @@
+[package]
+name = "server"
+version = "0.1.0"
+authors = ["= <jacob@rosborg.dk>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+wasmer-wasi = "1.0"
+serde = "1.0"
+bincode = "1.0"
+tracing = "0.1"
+quill = { path = "../api" }
+
+[dependencies.wasmer]
+version = "1.0"
+default-features = false
+features = ["jit", "llvm"]
