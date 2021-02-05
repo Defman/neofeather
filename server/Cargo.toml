@@ -13,6 +13,7 @@ serde = "1.0"
 bincode = "1.0"
 tracing = "0.1"
 quill = { path = "../api" }
+bevy_ecs = { git = "https://github.com/katharostech/bevy.git", branch = "feature/dynamic-systems-and-components", features = ["dynamic_api"]}
 
 [dependencies.wasmer]
 version = "1.0"

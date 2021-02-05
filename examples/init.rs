@@ -1,8 +1,6 @@
 use std::vec;
 
-use quill::{
-    PluginBuilder,
-};
+use quill::{PluginBuilder, ecs::Query};
 
 fn main() {
     PluginBuilder::new("hello world")
@@ -12,6 +10,8 @@ fn main() {
         .expect("could not initlize plugin");
 }
 
-// fn foo_system(query: Query<(&Player, &Health)>) {
-    
-// }
+fn foo_system(mut query: Query<(&(), &mut u32)>) {
+    for (_, health) in query.iter_mut() {
+        *health += 100;
+    }
+}

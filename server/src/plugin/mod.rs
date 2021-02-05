@@ -1,4 +1,5 @@
 use std::{
+    alloc::Layout,
     array::TryFromSliceError,
     borrow::BorrowMut,
     cell::{Cell, UnsafeCell},
@@ -10,13 +11,19 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    todo, u32,
+    todo, u32, vec,
 };
 
 use anyhow::{anyhow, Result};
+use bevy_ecs::{
+    ComponentId, DynamicFetch, DynamicFetchResult, DynamicQuery, DynamicSystem, EntityBuilder,
+    QueryAccess, StatefulQuery, TypeAccess, TypeInfo, World,
+};
+use bincode::DefaultOptions;
 use fs::OpenOptions;
 use io::IoSlice;
 use mem::ManuallyDrop;
+use quill::ecs::TypeLayout;
 use wasmer::{
     import_namespace, imports, Array, FromToNativeWasmType, Function, HostEnvInitError, Instance,
     LazyInit, Memory, Module, NativeFunc, Store, Type, ValueType, WasmPtr, WasmTypeList, WasmerEnv,
@@ -26,15 +33,28 @@ use wasmer_wasi::WasiState;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct PluginEnv<S> {
     memory: LazyInit<Memory>,
     buffer_reserve: LazyInit<NativeFunc<(WasmPtr<RawBuffer>, u32)>>,
-    rpcs: Arc<Mutex<HashMap<String, Box<dyn Fn(&mut Buffer, &mut S) + Send>>>>,
+    rpcs: Arc<Mutex<HashMap<String, Box<dyn Fn(&mut Buffer, &PluginEnv<S>) -> Result<()> + Send>>>>,
     state: Arc<Mutex<S>>,
+    layouts: Arc<Mutex<Layouts>>,
 }
 
-impl<S: Clone + Send + Sync> WasmerEnv for PluginEnv<S> {
+impl<S: Send + Sync + 'static> Clone for PluginEnv<S> {
+    fn clone(&self) -> Self {
+        Self {
+            memory: self.memory.clone(),
+            buffer_reserve: self.buffer_reserve.clone(),
+            rpcs: self.rpcs.clone(),
+            state: self.state.clone(),
+            layouts: Default::default(),
+        }
+    }
+}
+
+impl<S: Send + Sync + 'static> WasmerEnv for PluginEnv<S> {
     fn init_with_instance(&mut self, instance: &Instance) -> Result<(), HostEnvInitError> {
         let memory = instance.exports.get_memory("memory")?;
         self.memory.initialize(memory.clone());
@@ -47,7 +67,7 @@ impl<S: Clone + Send + Sync> WasmerEnv for PluginEnv<S> {
     }
 }
 
-impl<S: Clone + Send> PluginEnv<S> {
+impl<S: Send + Sync + 'static> PluginEnv<S> {
     fn memory(&self) -> &Memory {
         // TODO: handle errors.
         self.memory.get_ref().unwrap()
@@ -64,16 +84,48 @@ impl<S: Clone + Send> PluginEnv<S> {
             raw,
         }
     }
+
+    fn add_rpc<
+        'a,
+        Args: Serialize + DeserializeOwned + 'static,
+        R: Serialize + DeserializeOwned + 'static,
+    >(
+        &mut self,
+        name: &str,
+        callback: fn(&PluginEnv<S>, Args) -> R,
+    ) -> Result<()> {
+        self.rpcs
+            .lock()
+            .map_err(|_| anyhow!("could not lock rpcs"))?
+            .insert(
+                name.to_owned(),
+                Box::new(move |mut buffer: &mut Buffer, env: &PluginEnv<S>| {
+                    let (_, args): (String, Args) =
+                        bincode::deserialize(buffer.as_slice()).unwrap();
+
+                    let result = callback(env, args);
+                    buffer.clear();
+                    bincode::serialize_into(buffer, &result).unwrap();
+                    Ok(())
+                }),
+            );
+        Ok(())
+    }
+
+    fn call<Args: Serialize, R: DeserializeOwned>(&self, name: &str, args: Args) -> Result<R> {
+        // TODO: requires access to buffer.
+        todo!()
+    }
 }
 
 pub struct Plugin {
     instance: Instance,
-    env: PluginEnv<Vec<String>>,
+    env: PluginEnv<World>,
 }
 
 impl Plugin {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let env = PluginEnv::default();
+        let mut env = PluginEnv::default();
 
         let store = Store::new(&JIT::new(LLVM::default()).engine());
 
@@ -95,82 +147,122 @@ impl Plugin {
             }),
         );
 
+        // env.add_rpc("players_push", |state, player: String| state.push(player))?;
+        // // TODO: Return reference to state?
+        // env.add_rpc("players", |state, ()| state.clone())?;
+
+        env.add_rpc("world_spawn", |env, entity: quill::ecs::Entity| {
+            let mut world = env.state.lock().unwrap();
+            let mut layouts = env.layouts.lock().unwrap();
+
+            let mut builder = EntityBuilder::new();
+            for (layout, data) in entity.components {
+                builder.add_dynamic(
+                    TypeInfo::of_external(
+                        layouts.external_id(&layout),
+                        Layout::new::<Vec<u8>>(),
+                        |_| (),
+                    ),
+                    data.as_slice(),
+                );
+            }
+            world.spawn(builder.build());
+        })?;
+
+        env.add_rpc(
+            "world_query",
+            // TODO: world should not be the state but union(world, layouts)
+            |env, access: quill::ecs::QueryAccess| {
+                let world = env.state.lock().unwrap();
+                let mut layouts = env.layouts.lock().unwrap();
+
+                let query = access.query(&mut layouts).unwrap();
+                let access = Default::default();
+                let mut query: StatefulQuery<DynamicQuery, DynamicQuery> =
+                    StatefulQuery::new(&world, &access, query);
+
+                for entity in query.iter_mut() {
+                    entity.immutable;
+                    entity.mutable;
+                }
+            },
+        )?;
+
         let instance = Instance::new(&module, &import_object)?;
-
-        {
-            let mut rpcs = env.rpcs.lock().unwrap();
-
-            rpcs.insert(
-                "version".to_owned(),
-                Box::new(|buffer: &mut Buffer, state| {
-                    println!("....");
-                    // Read all arguments of call
-                    let mut reader = buffer.as_slice();
-                    let _: String = bincode::deserialize_from(&mut reader).unwrap();
-                    println!(".");
-                    // here you could read all the args
-                    // Clear the buffer to make place for the return value
-                    println!("..");
-                    buffer.clear();
-                    println!("....");
-                    bincode::serialize_into(buffer, "1.16").unwrap();
-                    println!(".....");
-                }),
-            );
-
-            rpcs.insert(
-                "hello".to_owned(),
-                Box::new(|buffer: &mut Buffer, state| {
-                    let mut reader = buffer.as_slice();
-                    let _: String = bincode::deserialize_from(&mut reader).unwrap();
-                    let name: String = bincode::deserialize_from(&mut reader).unwrap();
-                    println!("hello {}", name);
-                    buffer.clear();
-                }),
-            );
-
-            rpcs.insert(
-                "players_push".to_owned(),
-                Box::new(|buffer: &mut Buffer, state| {
-                    let mut reader = buffer.as_slice();
-                    let _: String = bincode::deserialize_from(&mut reader).unwrap();
-                    let player_name: String = bincode::deserialize_from(&mut reader).unwrap();
-                    state.push(player_name);
-                    println!("state: {:?}", state);
-                    buffer.clear();
-                }),
-            );
-
-            rpcs.insert(
-                "players".to_owned(),
-                Box::new(|mut buffer: &mut Buffer, state: &mut Vec<String>| {
-                    let mut reader = buffer.as_slice();
-                    let _: String = bincode::deserialize_from(&mut reader).unwrap();
-                    buffer.clear();
-                    // println!("host buffer cleared: {:?}", buffer.as_slice());
-                    bincode::serialize_into(&mut buffer, state).unwrap();
-                    // println!("host buffer {:?}", buffer.as_slice());
-                    // println!("expected buffer {:?}", bincode::serialize(state));
-                }),
-            );
-        }
 
         let start = instance.exports.get_function("_start")?;
         start.call(&[])?;
 
         Ok(Plugin { instance, env })
     }
+}
 
-    fn call<Args: Serialize, R: DeserializeOwned>(&self, name: &str, args: Args) -> Result<R> {
-        let client_rpc = self
-            .env
-            .rpcs
-            .lock()
-            .map_err(|_| anyhow!("could not get lock on client rpcs"))?
-            .get(name)
-            .ok_or(anyhow!("error"))?;
-        // let buffer = self.buffer_mut()?;
+#[derive(Default)]
+pub struct Layouts {
+    layouts: HashMap<quill::ecs::TypeLayout, u64>,
+}
+
+impl Layouts {
+    pub fn component_id(&mut self, layout: &TypeLayout) -> ComponentId {
+        ComponentId::ExternalId(self.external_id(layout))
+    }
+
+    pub fn external_id(&mut self, layout: &TypeLayout) -> u64 {
+        if let Some(component_id) = self.layouts.get(&layout) {
+            *component_id
+        } else {
+            let next = self.layouts.len() as u64;
+            self.layouts.insert(layout.clone(), next);
+            next
+        }
+    }
+}
+
+trait IntoBevyAccess {
+    fn access(&self, layouts: &mut Layouts) -> Result<QueryAccess>;
+    fn component_ids(&self) -> Result<Vec<ComponentId>>;
+
+    fn query(&self, layouts: &mut Layouts) -> Result<DynamicQuery>;
+}
+
+impl IntoBevyAccess for quill::ecs::QueryAccess {
+    fn access(&self, layouts: &mut Layouts) -> Result<QueryAccess> {
+        use quill::ecs::QueryAccess::*;
+        Ok(match self {
+            None => QueryAccess::None,
+            Read(layout) => QueryAccess::Read(layouts.component_id(layout), "??"),
+            Write(layout) => QueryAccess::Write(layouts.component_id(layout), "??"),
+            Optional(access) => {
+                QueryAccess::optional(IntoBevyAccess::access(access.as_ref(), layouts)?)
+            }
+            With(layout, access) => QueryAccess::With(
+                layouts.component_id(layout),
+                Box::new(IntoBevyAccess::access(access.as_ref(), layouts)?),
+            ),
+            Without(layout, access) => QueryAccess::Without(
+                layouts.component_id(layout),
+                Box::new(IntoBevyAccess::access(access.as_ref(), layouts)?),
+            ),
+            Union(accesses) => QueryAccess::Union(
+                accesses
+                    .into_iter()
+                    .map(|access| IntoBevyAccess::access(access, layouts))
+                    .collect::<Result<Vec<QueryAccess>>>()?,
+            ),
+        })
+    }
+
+    fn component_ids(&self) -> Result<Vec<ComponentId>> {
         todo!()
+    }
+
+    fn query(&self, layouts: &mut Layouts) -> Result<DynamicQuery> {
+        let mut query = DynamicQuery::default();
+        query.access = self.access(layouts)?;
+
+        // TODO: TypeInfo
+
+        Ok(query)
     }
 }
 
@@ -275,27 +367,13 @@ impl<'a> AsRef<[u8]> for Buffer<'a> {
     }
 }
 
-fn __quill_host_call(env: &PluginEnv<Vec<String>>, buffer_raw: WasmPtr<RawBuffer>) {
-    println!("buffer: {:?}", buffer_raw);
+fn __quill_host_call(env: &PluginEnv<World>, buffer_raw: WasmPtr<RawBuffer>) {
     let mut buffer = env.buffer(buffer_raw);
-
-    println!("host buffer: {:?}", buffer.as_slice());
-    // HERE
 
     let name: String = bincode::deserialize_from(buffer.as_slice()).unwrap();
 
-    println!("1");
-
     let rpcs = env.rpcs.lock().unwrap();
-    println!("2");
     let rpc = rpcs.get(&name).unwrap();
-    println!("3");
 
-    let mut state = env.state.lock().unwrap();
-    
-    println!("4");
-
-    rpc(&mut buffer, &mut state);
-    println!("5");
-    // Drop buffer here, bad... manual drop????
+    rpc(&mut buffer, env).unwrap();
 }
